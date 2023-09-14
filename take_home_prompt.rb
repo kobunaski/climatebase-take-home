@@ -27,6 +27,7 @@ class SmartJobBoard::JobAutoImport
 
     def get_all_job_boards
       begin
+        # We could query additional information here
         job_boards = JobBoard.all
       end
     end
@@ -67,6 +68,8 @@ class SmartJobBoard::JobAutoImport
         all_jobs.append(team_tailor_jobs) if team_tailor_jobs.class == Array
         all_jobs.flatten!
         puts "ALL JOBS SIZE: " + all_jobs.size.to_s
+
+        # Assume all_jobs is now array from JobsJobBoard table
         all_jobs
       rescue => e
         puts e
