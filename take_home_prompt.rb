@@ -5,37 +5,57 @@ class SmartJobBoard::JobAutoImport
       begin
         @broken_imports = []
 
-        all_jobs = get_all_jobs
-        if all_jobs.class != Array
-          @broken_imports.append({ "error"=> all_jobs, "source"=> "get_all_jobs method"}) unless @broken_imports.present?
-          send_error_email
-          puts "RUH ROH, AUTO IMPORT ERROR"
-          return "RUH ROH, AUTO IMPORT ERROR"
+        # We will get all jobs from employee like normal
+        employers = get_all_employers
+
+        employers.each do |employer|
+          all_jobs = get_all_jobs_by_employer(employer)
+          job_boards = employer.job_boards.where(active: true, deleted: false)
+
+          if all_jobs.class != Array
+            @broken_imports.append({ "error" => all_jobs, "source" => "get_all_jobs method" }) unless @broken_imports.present?
+            send_error_email
+            puts "RUH ROH, AUTO IMPORT ERROR"
+            return "RUH ROH, AUTO IMPORT ERROR"
+          end
+
+          if all_jobs.size == 0
+            send_error_email if @broken_imports.present?
+            return "no_new_jobs"
+          end
+
+          deactivate_all_jobs # only jobs created via Job Auto Import
+          jobs = Jobs.upsert_all(
+            all_jobs,
+            returning: %w[id status],
+            unique_by: [:ats_id]
+          )
+          job_ids = jobs.pluck('id')
+
+          job_boards.each do |job_board|
+            job_ids.each do |job_id|
+              JobsJobBoards.upsert(
+                job_id: job_id,
+                job_board_id: job_board.id,
+                returning: false,
+                status: status,
+                unique_by: [:ats_id]
+              )
+            end
+          end
+
+          all_jobs = nil # clear up memory
+
+          set_activation_histories
         end
 
-        if all_jobs.size == 0
-          send_error_email if @broken_imports.present?
-          return "no_new_jobs"
-        end
-
-        deactivate_all_jobs  # only jobs created via Job Auto Import
-
-        Job.upsert_all(
-          all_jobs,
-          returning: false,
-          unique_by: [:ats_id]
-        )
-
-        all_jobs = nil # clear up memory
-
-        set_activation_histories
         time = Time.now
         new_jobs = Job.where(active: true, posted_by: Job.posted_by_options["Job Auto Import"], created_at: (time - 900)..time)
         puts "latest_15_mins_jobs".concat(new_jobs.size.to_s)
         update_job_fields(new_jobs)
-        reindex_jobs(new_jobs)  # this will only run at 10am UTC
+        reindex_jobs(new_jobs) # this will only run at 10am UTC
 
-        new_jobs = nil  # clear up memory
+        new_jobs = nil # clear up memory
 
         puts "ANY BROKEN JOB IMPORTS? #{@broken_imports.present?.to_s}"
 
@@ -43,12 +63,30 @@ class SmartJobBoard::JobAutoImport
       rescue => e
         puts "GlOBAL ERROR"
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "call method"})
+        @broken_imports.append({ "error" => e.to_s, "source" => "call method" })
         send_error_email
       end
     end
 
     private
+
+    def get_all_employers
+      Employer.select(:id, :company_name, :email, :apply_url_tracking_params, :ats, :ats_url_param, :ats_key, :remote, :import_jobs, :company_description, :workday_credentials).where(active: true, deleted: false, import_jobs: true).where.not(ats: nil).where.not(ats: "team_tailor")
+    end
+
+    def get_all_jobs_by_employer(employer)
+      begin
+        all_jobs = get_job_feed_data(employer)
+        team_tailor_jobs = get_team_tailor_jobs
+        all_jobs.append(team_tailor_jobs) if team_tailor_jobs.class == Array
+        all_jobs.flatten!
+        puts "ALL JOBS SIZE: " + all_jobs.size.to_s
+        all_jobs
+      rescue => e
+        puts e
+        return "get_job_boards_by_employers_error"
+      end
+    end
 
     def get_all_jobs
       begin
@@ -65,19 +103,19 @@ class SmartJobBoard::JobAutoImport
       end
     end
 
-    def deactivate_all_jobs(employer=nil)
+    def deactivate_all_jobs(employer = nil)
       begin
         time = Time.now
         return unless [9, 10, 11].include?(time.hour)
         if employer.nil?
-          Job.where(active: true).where.not(ats_id: nil).update_all(active: false)
+          JobsJobBoards.where(active: true).where.not(ats_id: nil).update_all(active: false)
         else
-          Job.where(employer_id: employer.id, active: true).where.not(ats_id: nil).update_all(active: false)
+          JobsJobBoards.where(employer_id: employer.id, active: true).where.not(ats_id: nil).update_all(active: false)
         end
         puts "deactivated all jobs | " + time.to_s
       rescue => e
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "deactivate_all_jobs_error" })
+        @broken_imports.append({ "error" => e.to_s, "source" => "deactivate_all_jobs_error" })
       end
     end
 
@@ -91,7 +129,7 @@ class SmartJobBoard::JobAutoImport
         end
       rescue => e
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "reindex_jobs_error" })
+        @broken_imports.append({ "error" => e.to_s, "source" => "reindex_jobs_error" })
       end
     end
 
@@ -106,323 +144,322 @@ class SmartJobBoard::JobAutoImport
           job_type = job.custom_fields["job_type"].present? ? SmartJobBoard::CustomFieldsMethods.get_job_type(job.custom_fields["job_type"], job_types_all) : SmartJobBoard::CustomFieldsMethods.get_job_type(job.title, job_types_all)
           experience_levels = SmartJobBoard::CustomFieldsMethods.get_experience_levels(job, experience_levels_all)
 
-          job_specific_fields = {"categories"=> categories_data['categories'], "sub_categories"=> categories_data['sub_categories'], "job_type"=> job_type, "experience_levels"=> experience_levels}
+          job_specific_fields = { "categories" => categories_data['categories'], "sub_categories" => categories_data['sub_categories'], "job_type" => job_type, "experience_levels" => experience_levels }
           SmartJobBoard::CustomFieldsMethods.add_job_custom_fields(job)
           SmartJobBoard::CustomFieldsMethods.add_job_specific_fields(job, job_specific_fields)
-          Superlinked::UploadRecordToSuperlinked.call("new_job", {"job_id"=> job.id})
+          Superlinked::UploadRecordToSuperlinked.call("new_job", { "job_id" => job.id })
         end
       rescue => e
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "update_job_fields_error" })
+        @broken_imports.append({ "error" => e.to_s, "source" => "update_job_fields_error" })
       end
     end
 
-    def set_activation_histories(employer=nil)
+    def set_activation_histories(employer = nil)
       begin
         current_time = Time.now
         jobs = employer.nil? ? Job.where(active: true).where.not(ats_id: nil) : Job.where(employer_id: employer.id, active: true).where.not(ats_id: nil)
         jobs.find_each(batch_size: 100) do |job|
           activation_history = job.activation_history.present? && job.activation_history.has_key?('date_ranges') ? job.activation_history['date_ranges'] : []
-          if activation_history.size == 0 || (activation_history[-1]['to'].present? && current_time > activation_history[-1]['to'])  # no history logged or logged expiration date is in the past
-            activation_history.append({"from"=> current_time, "to"=> nil})
-            job.update(activation_history: {"date_ranges"=> activation_history}, activation_date: current_time, expiration_date: nil)
+          if activation_history.size == 0 || (activation_history[-1]['to'].present? && current_time > activation_history[-1]['to']) # no history logged or logged expiration date is in the past
+            activation_history.append({ "from" => current_time, "to" => nil })
+            job.update(activation_history: { "date_ranges" => activation_history }, activation_date: current_time, expiration_date: nil)
           else
             next if job.activation_date.present?
             activation_history[-1]['from'] = current_time
             activation_history[-1]['to'] = nil
-            job.update(activation_history: {"date_ranges"=> activation_history}, activation_date: current_time, expiration_date: nil) unless activation_history == job.activation_history
+            job.update(activation_history: { "date_ranges" => activation_history }, activation_date: current_time, expiration_date: nil) unless activation_history == job.activation_history
           end
         end
       rescue => e
         puts "ERROR SETTING ACTIVATION HISTORIES"
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "set_activation_histories" })
+        @broken_imports.append({ "error" => e.to_s, "source" => "set_activation_histories" })
       end
     end
 
-    def get_job_feed_data(employers, employers_only=false)
+    def get_job_feed_data(employer, employers_only = false)
       begin
         job_batch = []
-        employers.each do |employer|
-          ats = employer.ats
-          puts ats
-          case ats
-          when "lever"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_lever_jobs(employer.ats_url_param)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "lever", employer)
-            puts "LEVER COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
 
-          when "greenhouse"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_greenhouse_jobs(employer.ats_url_param)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "greenhouse", employer)
-            puts "GREENHOUSE COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "workable"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_workable_jobs(employer.ats_url_param)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "workable", employer)
-            puts "WORKABLE COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "ashby"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_ashby_jobs(employer.ats_url_param)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "ashby", employer)
-            puts "ASHBY COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "recruitee"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_recruitee_jobs(employer.ats_url_param)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "recruitee", employer)
-            puts "RECRUITEE COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "sync_hr"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_synchr_jobs(employer.ats_url_param)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "sync_hr", employer)
-            puts "SYNCHR COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "clear_company"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_clearcompany_jobs(employer.ats_url_param, employer.apply_url_tracking_params)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "clear_company", employer)
-            puts "CLEAR COMPANY COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "breezy_hr"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_breezy_jobs(employer.ats_url_param)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "breezy_hr", employer)
-            puts "BREEZY COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "jazz_hr"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_jazz_jobs(employer.ats_key)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "jazz_hr", employer)
-            puts "JAZZ COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "rippling"
-            jobs = WebScraper::ScrapeAtsJobs.get_rippling_jobs(employer.ats_url_param)
-            puts employer.email
-            if jobs.class != Hash
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "rippling", employer)
-            puts "RIPPLING COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "bamboo_hr"
-            jobs = WebScraper::ScrapeAtsJobs.get_bamboo_hr_jobs(employer.ats_url_param)
-            if jobs.class != Hash
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            puts employer.email
-            transformed_jobs = transform_jobs(jobs, "bamboo_hr", employer)
-            puts "BAMBOO COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "personio"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_personio_jobs(employer.ats_url_param)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "personio", employer)
-            puts "PERSONIO COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "jobvite"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_jobvite_jobs(employer.ats_url_param)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "jobvite", employer)
-            puts "JOBVITE COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "polymer"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_polymer_jobs(employer.ats_url_param)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "polymer", employer)
-            puts "POLYMER COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "jobscore"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_jobscore_jobs(employer.ats_url_param)
-            puts employer.email
-            if jobs == "error_during_api_call"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "jobscore", employer)
-            puts "JOBSCORE COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "icims"
-            jobs = WebScraper::ScrapeAtsJobs.get_icims_jobs(employer.ats_url_param)
-            if jobs.class != Array
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            puts employer.email
-            transformed_jobs = transform_jobs(jobs, "icims", employer)
-            puts "ICIMS COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          when "workday"
-            jobs = SmartJobBoard::AtsFeedsApiClient.get_workday_jobs(employer)
-            puts employer.email
-            if jobs == "error_during_api_call" || jobs == "error_during_authentication"
-              @broken_imports.append({ "email"=> employer.email, "error"=> jobs, "ats"=> ats, "source"=> "error_during_api_call" })
-              next
-            end
-            transformed_jobs = transform_jobs(jobs, "workday", employer)
-            puts "WORKDAY COUNT " + transformed_jobs.size.to_s
-            return transformed_jobs if employers_only
-            if transformed_jobs.class == Array
-              job_batch.append(transformed_jobs)
-            else
-              @broken_imports.append({ "email"=> employer.email, "error"=> transformed_jobs.to_s, "ats"=> ats, "source"=> "transform_jobs" })
-            end
-
-          else
-            @broken_imports.append({ "email"=> employer.email, "error"=> "ats_not_recognized", "ats"=> ats, "source"=> "transform_jobs" })
-            puts "ats_not_recognized"
+        ats = employer.ats
+        puts ats
+        case ats
+        when "lever"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_lever_jobs(employer.ats_url_param)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
           end
+          transformed_jobs = transform_jobs(jobs, "lever", employer)
+          puts "LEVER COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "greenhouse"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_greenhouse_jobs(employer.ats_url_param)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "greenhouse", employer)
+          puts "GREENHOUSE COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "workable"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_workable_jobs(employer.ats_url_param)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "workable", employer)
+          puts "WORKABLE COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "ashby"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_ashby_jobs(employer.ats_url_param)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "ashby", employer)
+          puts "ASHBY COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "recruitee"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_recruitee_jobs(employer.ats_url_param)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "recruitee", employer)
+          puts "RECRUITEE COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "sync_hr"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_synchr_jobs(employer.ats_url_param)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "sync_hr", employer)
+          puts "SYNCHR COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "clear_company"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_clearcompany_jobs(employer.ats_url_param, employer.apply_url_tracking_params)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "clear_company", employer)
+          puts "CLEAR COMPANY COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "breezy_hr"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_breezy_jobs(employer.ats_url_param)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "breezy_hr", employer)
+          puts "BREEZY COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "jazz_hr"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_jazz_jobs(employer.ats_key)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "jazz_hr", employer)
+          puts "JAZZ COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "rippling"
+          jobs = WebScraper::ScrapeAtsJobs.get_rippling_jobs(employer.ats_url_param)
+          puts employer.email
+          if jobs.class != Hash
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "rippling", employer)
+          puts "RIPPLING COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "bamboo_hr"
+          jobs = WebScraper::ScrapeAtsJobs.get_bamboo_hr_jobs(employer.ats_url_param)
+          if jobs.class != Hash
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          puts employer.email
+          transformed_jobs = transform_jobs(jobs, "bamboo_hr", employer)
+          puts "BAMBOO COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "personio"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_personio_jobs(employer.ats_url_param)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "personio", employer)
+          puts "PERSONIO COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "jobvite"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_jobvite_jobs(employer.ats_url_param)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "jobvite", employer)
+          puts "JOBVITE COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "polymer"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_polymer_jobs(employer.ats_url_param)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "polymer", employer)
+          puts "POLYMER COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "jobscore"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_jobscore_jobs(employer.ats_url_param)
+          puts employer.email
+          if jobs == "error_during_api_call"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "jobscore", employer)
+          puts "JOBSCORE COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "icims"
+          jobs = WebScraper::ScrapeAtsJobs.get_icims_jobs(employer.ats_url_param)
+          if jobs.class != Array
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          puts employer.email
+          transformed_jobs = transform_jobs(jobs, "icims", employer)
+          puts "ICIMS COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        when "workday"
+          jobs = SmartJobBoard::AtsFeedsApiClient.get_workday_jobs(employer)
+          puts employer.email
+          if jobs == "error_during_api_call" || jobs == "error_during_authentication"
+            @broken_imports.append({ "email" => employer.email, "error" => jobs, "ats" => ats, "source" => "error_during_api_call" })
+            next
+          end
+          transformed_jobs = transform_jobs(jobs, "workday", employer)
+          puts "WORKDAY COUNT " + transformed_jobs.size.to_s
+          return transformed_jobs if employers_only
+          if transformed_jobs.class == Array
+            job_batch.append(transformed_jobs)
+          else
+            @broken_imports.append({ "email" => employer.email, "error" => transformed_jobs.to_s, "ats" => ats, "source" => "transform_jobs" })
+          end
+
+        else
+          @broken_imports.append({ "email" => employer.email, "error" => "ats_not_recognized", "ats" => ats, "source" => "transform_jobs" })
+          puts "ats_not_recognized"
         end
 
         job_batch.flatten
@@ -432,15 +469,15 @@ class SmartJobBoard::JobAutoImport
       end
     end
 
-    def get_team_tailor_jobs(employer=nil)
+    def get_team_tailor_jobs(employer = nil)
       begin
         jobs = SmartJobBoard::AtsFeedsApiClient.get_teamtailor_jobs
         if jobs.class != Array
-          @broken_imports.append({ "error"=> jobs.to_s, "ats"=> "team_tailor", "source"=> "error_during_api_call" })
+          @broken_imports.append({ "error" => jobs.to_s, "ats" => "team_tailor", "source" => "error_during_api_call" })
           return
         end
 
-        employers = jobs.map {|j| j['company']}.uniq!
+        employers = jobs.map { |j| j['company'] }.uniq!
         employer_objects_mapping = {}
 
         if employer.class == Employer
@@ -458,7 +495,7 @@ class SmartJobBoard::JobAutoImport
 
         transformed_jobs = transform_jobs(jobs, "team_tailor", nil, employer_objects_mapping)
         if transformed_jobs.class != Array
-          @broken_imports.append({ "error"=> transformed_jobs.to_s, "ats"=> "team_tailor", "source"=> "transform_jobs" })
+          @broken_imports.append({ "error" => transformed_jobs.to_s, "ats" => "team_tailor", "source" => "transform_jobs" })
           return
         end
 
@@ -467,12 +504,12 @@ class SmartJobBoard::JobAutoImport
       rescue => e
         puts "ERROR GETTING TEAM TAILOR JOBS"
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "ats"=> "team_tailor", "source"=> "get_team_tailor_jobs" })
+        @broken_imports.append({ "error" => e.to_s, "ats" => "team_tailor", "source" => "get_team_tailor_jobs" })
         return
       end
     end
 
-    def transform_jobs(jobs, ats, employer, employer_object_mapping=nil)
+    def transform_jobs(jobs, ats, employer, employer_object_mapping = nil)
       begin
         posted_by = "Job Auto Import"
         status = "active"
@@ -540,7 +577,7 @@ class SmartJobBoard::JobAutoImport
             job['remote'] = employer&.remote || location == "" || location.downcase.include?("remote") || job['telecommuting'] == true || job['title'].to_s.downcase.include?("remote")
             job['ats_id'] = ats_id_prefix + job.delete('shortcode').to_s
             job['posted_by'] = posted_by
-            custom_fields = {"experience_level"=> {"seniority"=> job['experience']}}
+            custom_fields = { "experience_level" => { "seniority" => job['experience'] } }
             job['custom_fields'] = custom_fields
             job.select! { |k, v| select_keys.include?(k) }
           end
@@ -584,7 +621,7 @@ class SmartJobBoard::JobAutoImport
             job['remote'] = job['remote'] == true || employer&.remote || location == "" || location.downcase.include?("remote") || job['title'].to_s.downcase.include?("remote")
             job['ats_id'] = ats_id_prefix + job.delete('id').to_s
             job['posted_by'] = posted_by
-            custom_fields = {"experience_level"=> {"seniority"=> job['experience_code']}}
+            custom_fields = { "experience_level" => { "seniority" => job['experience_code'] } }
             job['custom_fields'] = custom_fields
             job.select! { |k, v| select_keys.include?(k) }
           end
@@ -730,13 +767,13 @@ class SmartJobBoard::JobAutoImport
               job_final['posted_by'] = posted_by
               job_final['custom_fields'] = custom_fields
               transformed_jobs.append(job_final)
-              job_final = nil  # clear for memory
+              job_final = nil # clear for memory
             rescue => e
               puts e
             end
           end
           if jobs.size != transformed_jobs.size
-            @broken_imports.append({ "email"=> employer.email, "error"=> "could_not_successfully_transform_ALL_jobs", "ats"=> ats, "source"=> "transform_jobs" })
+            @broken_imports.append({ "email" => employer.email, "error" => "could_not_successfully_transform_ALL_jobs", "ats" => ats, "source" => "transform_jobs" })
           end
           return transformed_jobs
         when "bamboo_hr"
@@ -765,16 +802,16 @@ class SmartJobBoard::JobAutoImport
               job_final['remote'] = employer&.remote || !location.present? || location.downcase.include?("remote") || title.downcase.include?("remote")
               job_final['ats_id'] = ats_id_prefix + "#{Digest::MD5.hexdigest(job_final['how_to_apply'])}"
               job_final['posted_by'] = posted_by
-              custom_fields = {"job_type"=> fields['job_type'], "experience_level"=> fields['experience_level']}
+              custom_fields = { "job_type" => fields['job_type'], "experience_level" => fields['experience_level'] }
               job_final['custom_fields'] = custom_fields
               transformed_jobs.append(job_final)
-              job_final = nil  # clear for memory
+              job_final = nil # clear for memory
             rescue => e
               puts e
             end
           end
           if jobs.size != transformed_jobs.size
-            @broken_imports.append({ "email"=> employer.email, "error"=> "could_not_successfully_transform_ALL_jobs", "ats"=> ats, "source"=> "transform_jobs" })
+            @broken_imports.append({ "email" => employer.email, "error" => "could_not_successfully_transform_ALL_jobs", "ats" => ats, "source" => "transform_jobs" })
           end
           return transformed_jobs
         when "personio"
@@ -795,7 +832,7 @@ class SmartJobBoard::JobAutoImport
             job['ats_id'] = ats_id_prefix + "#{Digest::MD5.hexdigest(job['how_to_apply'])}"
             job['posted_by'] = posted_by
             experience_levels = get_personio_experience_levels(job)
-            custom_fields = {"job_type"=> job['schedule'], "experience_level"=> experience_levels}
+            custom_fields = { "job_type" => job['schedule'], "experience_level" => experience_levels }
             job['custom_fields'] = custom_fields
             job.select! { |k, v| select_keys.include?(k) }
           end
@@ -817,7 +854,7 @@ class SmartJobBoard::JobAutoImport
             job['remote'] = employer&.remote || location == "" || location.downcase.include?("remote") || job['title'].to_s.downcase.include?("remote")
             job['ats_id'] = ats_id_prefix + "#{employer.id.to_s.concat(job['id'].to_s)}"
             job['posted_by'] = posted_by
-            custom_fields = {"job_type"=> job['jobtype']}
+            custom_fields = { "job_type" => job['jobtype'] }
             job['custom_fields'] = custom_fields
             job.select! { |k, v| select_keys.include?(k) }
           end
@@ -839,7 +876,7 @@ class SmartJobBoard::JobAutoImport
             job['remote'] = employer&.remote || location == "" || ["remote friendly", "remote"].include?(job['remoteness_pretty'].downcase)
             job['ats_id'] = ats_id_prefix + job.delete('id').to_s
             job['posted_by'] = posted_by
-            custom_fields = {"job_type"=> job['kind_pretty']}
+            custom_fields = { "job_type" => job['kind_pretty'] }
             job['custom_fields'] = custom_fields
             job.select! { |k, v| select_keys.include?(k) }
           end
@@ -861,7 +898,7 @@ class SmartJobBoard::JobAutoImport
             job['remote'] = employer&.remote || location == "" || job['remote'].to_s.downcase.include?("yes")
             job['ats_id'] = ats_id_prefix + job.delete('id').to_s
             job['posted_by'] = posted_by
-            custom_fields = {"job_type"=> job['job_type'], "experience_level"=> {"seniority"=> job['experience_level']}}
+            custom_fields = { "job_type" => job['job_type'], "experience_level" => { "seniority" => job['experience_level'] } }
             job['custom_fields'] = custom_fields
             job.select! { |k, v| select_keys.include?(k) }
           end
@@ -889,10 +926,10 @@ class SmartJobBoard::JobAutoImport
             job_final['posted_by'] = posted_by
             job_final['custom_fields'] = custom_fields
             transformed_jobs.append(job_final)
-            job_final = nil  # clear for memory
+            job_final = nil # clear for memory
           end
           if jobs.size != transformed_jobs.size
-            @broken_imports.append({ "email"=> employer.email, "error"=> "could_not_successfully_transform_ALL_jobs", "ats"=> ats, "source"=> "transform_jobs" })
+            @broken_imports.append({ "email" => employer.email, "error" => "could_not_successfully_transform_ALL_jobs", "ats" => ats, "source" => "transform_jobs" })
           end
           return transformed_jobs
         when "workday"
@@ -914,7 +951,7 @@ class SmartJobBoard::JobAutoImport
             job['ats_id'] = ats_id_prefix + job.delete('id').to_s
             job['posted_by'] = posted_by
             job_type = job['timeType'].is_a?(Hash) ? job['timeType']['descriptor'] : "Full time"
-            custom_fields = {"job_type"=> job_type}
+            custom_fields = { "job_type" => job_type }
             job['custom_fields'] = custom_fields
             job.select! { |k, v| select_keys.include?(k) }
           end
@@ -927,7 +964,8 @@ class SmartJobBoard::JobAutoImport
       end
     end
 
-    def get_location(job, ats, employer)  # also returns title for select ATS
+    def get_location(job, ats, employer)
+      # also returns title for select ATS
       begin
         remote_synonyms = ["anywhere", "talent network", "remote", "distributed", "virtual", "worldwide", "nationwide", "any location", "multiple locations", "add location"]
         case ats
@@ -1126,8 +1164,8 @@ class SmartJobBoard::JobAutoImport
           location.concat(job['jobLocation'][0]['address']['addressCountry']) if job['jobLocation'][0]['address']['addressCountry'].present? && job['jobLocation'][0]['address']['addressCountry'] != "UNAVAILABLE"
           return location
         when "workday"
-          return "" if job['id'].present? && job['primaryLocation'].blank?  # if job['id'] is present, then job data is present, just doesn't have location
-          return job['primaryLocation']['descriptor']  # in the future, look at 'additionalLocations' key
+          return "" if job['id'].present? && job['primaryLocation'].blank? # if job['id'] is present, then job data is present, just doesn't have location
+          return job['primaryLocation']['descriptor'] # in the future, look at 'additionalLocations' key
         else
           puts "ats_not_recognized"
           return ""
@@ -1135,7 +1173,7 @@ class SmartJobBoard::JobAutoImport
       rescue => e
         puts "GET LOCATION ERROR"
         puts e
-        @broken_imports.append({ "email"=> employer&.email, "error"=> e.to_s, "ats"=> ats, "source"=> "get_location" }) unless @broken_imports.include?({ "email"=> employer&.email, "error"=> e.to_s, "ats"=> ats, "source"=> "get_location" })
+        @broken_imports.append({ "email" => employer&.email, "error" => e.to_s, "ats" => ats, "source" => "get_location" }) unless @broken_imports.include?({ "email" => employer&.email, "error" => e.to_s, "ats" => ats, "source" => "get_location" })
         return ""
       end
     end
@@ -1162,7 +1200,6 @@ class SmartJobBoard::JobAutoImport
       nil
     end
 
-
     def get_rippling_fields(job)
       begin
         title_and_location = job.xpath("//div[@class='job-title-container']")
@@ -1175,16 +1212,17 @@ class SmartJobBoard::JobAutoImport
           location.tr!("\n", "")
           location.strip!
         end
-        return {"title"=> title, "location"=> location}
+        return { "title" => title, "location" => location }
       rescue => e
         puts "GET RIPPLING FIELDS ERROR"
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "get_rippling_fields" }) unless @broken_imports.include?({ "error"=> e.to_s, "source"=> "get_rippling_fields" })
+        @broken_imports.append({ "error" => e.to_s, "source" => "get_rippling_fields" }) unless @broken_imports.include?({ "error" => e.to_s, "source" => "get_rippling_fields" })
         return
       end
     end
 
-    def get_icims_fields(job)  # url, description, title, location
+    def get_icims_fields(job)
+      # url, description, title, location
       begin
         fields = JSON.parse job.children[1].children[3].children[11].children.text
 
@@ -1198,18 +1236,18 @@ class SmartJobBoard::JobAutoImport
         description = fields['description']
         description.tr!("\n", "")
 
-        {"url"=> fields['url'], "description"=> description, "title"=> fields['title'], "location"=> location}
+        { "url" => fields['url'], "description" => description, "title" => fields['title'], "location" => location }
       rescue => e
         puts "GET iCIMS FIELDS ERROR"
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "get_icims_fields" }) unless @broken_imports.include?({ "error"=> e.to_s, "source"=> "get_icims_fields" })
+        @broken_imports.append({ "error" => e.to_s, "source" => "get_icims_fields" }) unless @broken_imports.include?({ "error" => e.to_s, "source" => "get_icims_fields" })
         return
       end
     end
 
     def set_lever_description(job, employer_id)
       begin
-        do_not_sanitize = [1131712, 1131415]  # IDs of employers who we should not HTML sanitize description for
+        do_not_sanitize = [1131712, 1131415] # IDs of employers who we should not HTML sanitize description for
         description_text = ""
         if job.include?("description")
           description_text.concat(job.delete("description").to_s.concat("<br><br>"))
@@ -1234,7 +1272,7 @@ class SmartJobBoard::JobAutoImport
       rescue => e
         puts "LEVER DESCRIPTION ERROR"
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "get_lever_description" }) unless @broken_imports.include?({ "error"=> e.to_s, "source"=> "get_lever_description" })
+        @broken_imports.append({ "error" => e.to_s, "source" => "get_lever_description" }) unless @broken_imports.include?({ "error" => e.to_s, "source" => "get_lever_description" })
         return ""
       end
     end
@@ -1251,7 +1289,7 @@ class SmartJobBoard::JobAutoImport
       rescue => e
         puts "RIPPLING DESCRIPTION ERROR"
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "get_rippling_description" }) unless @broken_imports.include?({ "error"=> e.to_s, "source"=> "get_rippling_description" })
+        @broken_imports.append({ "error" => e.to_s, "source" => "get_rippling_description" }) unless @broken_imports.include?({ "error" => e.to_s, "source" => "get_rippling_description" })
         return ""
       end
     end
@@ -1269,7 +1307,7 @@ class SmartJobBoard::JobAutoImport
       rescue => e
         puts "BAMBOO DESCRIPTION ERROR"
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "get_bamboo_description" }) unless @broken_imports.include?({ "error"=> e.to_s, "source"=> "get_bamboo_description" })
+        @broken_imports.append({ "error" => e.to_s, "source" => "get_bamboo_description" }) unless @broken_imports.include?({ "error" => e.to_s, "source" => "get_bamboo_description" })
         return ""
       end
     end
@@ -1311,7 +1349,7 @@ class SmartJobBoard::JobAutoImport
           puts fields_index
           return get_bamboo_fields(job, employer, fields_index)
         else
-          @broken_imports.append({ "error"=> e.to_s, "source"=> "get_bamboo_fields", "email"=> employer.email }) unless @broken_imports.include?({ "error"=> e.to_s, "source"=> "get_bamboo_fields", "email"=> employer.email })
+          @broken_imports.append({ "error" => e.to_s, "source" => "get_bamboo_fields", "email" => employer.email }) unless @broken_imports.include?({ "error" => e.to_s, "source" => "get_bamboo_fields", "email" => employer.email })
           return
         end
       end
@@ -1338,26 +1376,26 @@ class SmartJobBoard::JobAutoImport
         years_exp[1] = years_exp[1].to_i if years_exp[1].present?
 
         if years_exp.present? && (years_exp[0].class == Integer || years_exp[1].class == Integer)
-          return {"min_years"=> years_exp[0], "max_years"=> years_exp[1]}
+          return { "min_years" => years_exp[0], "max_years" => years_exp[1] }
         else
-          return {"seniority"=> job['seniority']}
+          return { "seniority" => job['seniority'] }
         end
 
       rescue => e
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "get_personio_experience_levels" }) unless @broken_imports.include?({ "error"=> e.to_s, "source"=> "get_personio_experience_levels" })
+        @broken_imports.append({ "error" => e.to_s, "source" => "get_personio_experience_levels" }) unless @broken_imports.include?({ "error" => e.to_s, "source" => "get_personio_experience_levels" })
       end
     end
 
     def sanitize_description(description)
       begin
-        description = ActionController::Base.helpers.sanitize(CGI.unescapeHTML(description), {:tags=>['div', 'b', 'em', 'strong', 'a', 'p', 'br', 'span', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'hr', 'img'], :attributes=>['href', 'style', 'src']})
+        description = ActionController::Base.helpers.sanitize(CGI.unescapeHTML(description), { :tags => ['div', 'b', 'em', 'strong', 'a', 'p', 'br', 'span', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'hr', 'img'], :attributes => ['href', 'style', 'src'] })
         description.gsub!(/\n/, '')
         description
       rescue => e
         puts "SANITIZE DESCRIPTION ERROR"
         puts e
-        @broken_imports.append({ "error"=> e.to_s, "source"=> "sanitize_description" }) unless @broken_imports.include?({ "error"=> e.to_s, "source"=> "sanitize_description" })
+        @broken_imports.append({ "error" => e.to_s, "source" => "sanitize_description" }) unless @broken_imports.include?({ "error" => e.to_s, "source" => "sanitize_description" })
         return description
       end
     end
@@ -1365,17 +1403,17 @@ class SmartJobBoard::JobAutoImport
     def custom_location_fields(job, employer)
       begin
         if employer&.id == 1131507 && job['location']['name'].to_s.downcase.include?("headquarter")
-          return {"needs_custom_location"=> true, "location"=> "Berkeley, CA, USA"}
+          return { "needs_custom_location" => true, "location" => "Berkeley, CA, USA" }
         end
-        return {"needs_custom_location"=> false}
+        return { "needs_custom_location" => false }
       rescue => e
         puts e
-        return {"needs_custom_location"=> false}
+        return { "needs_custom_location" => false }
       end
     end
 
     def send_error_email
-      error_params = {"broken_imports"=> @broken_imports}
+      error_params = { "broken_imports" => @broken_imports }
       Emails::InternalNotificationBrokenJobImportJob.perform_later error_params unless Rails.env.test?
     end
 
